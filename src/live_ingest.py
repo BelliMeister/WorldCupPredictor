@@ -1,6 +1,6 @@
 """
-Live match ingestion — fetches WC 2026 results from ESPN and
-patches international_results.csv, then optionally retrains the model.
+Live match ingestion — fetches WC 2026 results from football-data.org (primary)
+with ESPN as fallback, then patches international_results.csv.
 
 Usage:
   python src/live_ingest.py               # fetch + show live scoreboard
@@ -19,40 +19,109 @@ from pathlib import Path
 
 import pandas as pd
 
+from config import get_key, FOOTBALL_DATA_API_KEY
+
 RESULTS_CSV = Path("data/raw/international_results.csv")
-ESPN_BASE = "http://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
 
-# All statuses ESPN uses for a completed match
-COMPLETED_STATUSES = {
-    "STATUS_FINAL",
-    "STATUS_FULL_TIME",
-    "STATUS_FULL_PEN",
-    "STATUS_EXTRA_TIME",
-    "STATUS_PENALTY",
-    "STATUS_FT",
+FD_API_KEY  = get_key(FOOTBALL_DATA_API_KEY)
+FD_BASE     = "https://api.football-data.org/v4/competitions/WC/matches"
+ESPN_BASE   = "http://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
+
+# football-data.org match statuses
+FD_FINISHED  = {"FINISHED"}
+FD_LIVE      = {"IN_PLAY", "PAUSED", "HALFTIME"}
+FD_SCHEDULED = {"TIMED", "SCHEDULED"}
+
+# ESPN statuses
+ESPN_COMPLETED = {
+    "STATUS_FINAL", "STATUS_FULL_TIME", "STATUS_FULL_PEN",
+    "STATUS_EXTRA_TIME", "STATUS_PENALTY", "STATUS_FT",
 }
 
-# ESPN display names → names in international_results.csv
-TEAM_NAME_MAP = {
-    "USA": "United States",
-    "United States of America": "United States",
-    "Korea Republic": "South Korea",
-    "IR Iran": "Iran",
-    "Türkiye": "Turkey",
-    "Czechia": "Czech Republic",
-    "Bosnia-Herzegovina": "Bosnia and Herzegovina",
-    "Congo DR": "DR Congo",
-    "Cape Verde Islands": "Cape Verde",
+# football-data.org team names → international_results.csv names
+FD_TEAM_MAP = {
+    "USA":               "United States",
+    "Korea Republic":    "South Korea",
+    "IR Iran":           "Iran",
+    "Türkiye":           "Turkey",
+    "Czechia":           "Czech Republic",
+    "Bosnia-Herzegovina":"Bosnia and Herzegovina",
+    "Congo DR":          "DR Congo",
+    "Cape Verde Islands":"Cape Verde",
     "Trinidad & Tobago": "Trinidad and Tobago",
+    "Côte d'Ivoire":     "Ivory Coast",
+    "Curaçao":           "Curaçao",
+}
+
+# ESPN team names → international_results.csv names
+ESPN_TEAM_MAP = {
+    "USA":                      "United States",
+    "United States of America": "United States",
+    "Korea Republic":           "South Korea",
+    "IR Iran":                  "Iran",
+    "Türkiye":                  "Turkey",
+    "Czechia":                  "Czech Republic",
+    "Bosnia-Herzegovina":       "Bosnia and Herzegovina",
+    "Congo DR":                 "DR Congo",
+    "Cape Verde Islands":       "Cape Verde",
+    "Trinidad & Tobago":        "Trinidad and Tobago",
 }
 
 
-def normalise_name(name: str) -> str:
-    return TEAM_NAME_MAP.get(name, name)
+def _fd_name(name: str) -> str:
+    return FD_TEAM_MAP.get(name, name)
 
 
-def _fetch_date(date_str: str) -> list[dict]:
-    """Fetch ESPN scoreboard for a specific date (YYYYMMDD)."""
+def _espn_name(name: str) -> str:
+    return ESPN_TEAM_MAP.get(name, name)
+
+
+# ── football-data.org fetcher ──────────────────────────────────────────────────
+
+def fetch_fd_matches() -> list[dict] | None:
+    """Fetch all WC 2026 matches from football-data.org. Returns None on error."""
+    if not FD_API_KEY:
+        print("[football-data.org] no API key set — skipping (using ESPN).")
+        return None
+    req = urllib.request.Request(
+        FD_BASE,
+        headers={"X-Auth-Token": FD_API_KEY, "User-Agent": "WCPredictor/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except Exception as e:
+        print(f"[football-data.org] Error: {e}")
+        return None
+
+    matches = []
+    for m in data.get("matches", []):
+        home   = _fd_name(m["homeTeam"]["name"])
+        away   = _fd_name(m["awayTeam"]["name"])
+        ft     = m.get("score", {}).get("fullTime", {})
+        status = m.get("status", "")
+
+        hs = ft.get("home")
+        as_ = ft.get("away")
+        matches.append({
+            "date":       m["utcDate"][:10],
+            "home_team":  home,
+            "away_team":  away,
+            "home_score": float(hs)  if hs  is not None else None,
+            "away_score": float(as_) if as_ is not None else None,
+            "status":     status,
+            "clock":      "",
+            "tournament": "FIFA World Cup",
+            "country":    "United States",
+            "neutral":    True,
+            "source":     "fd",
+        })
+    return matches
+
+
+# ── ESPN fallback fetcher ──────────────────────────────────────────────────────
+
+def _espn_fetch_date(date_str: str) -> list[dict]:
     url = f"{ESPN_BASE}?dates={date_str}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -65,15 +134,12 @@ def _fetch_date(date_str: str) -> list[dict]:
 
 
 def fetch_espn_matches(lookback_days: int = 4) -> list[dict]:
-    """Fetch WC matches for today and the last lookback_days days."""
     from datetime import timedelta
     today = datetime.now(timezone.utc).date()
-    all_events = []
-    seen_ids = set()
+    all_events, seen_ids = [], set()
     for delta in range(lookback_days, -1, -1):
         day = today - timedelta(days=delta)
-        date_str = day.strftime("%Y%m%d")
-        for event in _fetch_date(date_str):
+        for event in _espn_fetch_date(day.strftime("%Y%m%d")):
             eid = event.get("id")
             if eid not in seen_ids:
                 seen_ids.add(eid)
@@ -81,38 +147,61 @@ def fetch_espn_matches(lookback_days: int = 4) -> list[dict]:
 
     matches = []
     for event in all_events:
-        comp = event.get("competitions", [{}])[0]
+        comp        = event.get("competitions", [{}])[0]
         status_type = comp.get("status", {}).get("type", {})
-        status = status_type.get("name", "")
-
+        status      = status_type.get("name", "")
         competitors = comp.get("competitors", [])
         if len(competitors) != 2:
             continue
-
         home = next((c for c in competitors if c.get("homeAway") == "home"), None)
         away = next((c for c in competitors if c.get("homeAway") == "away"), None)
         if not home or not away:
             continue
-
-        home_score = home.get("score")
-        away_score = away.get("score")
-
+        hs  = home.get("score")
+        as_ = away.get("score")
         matches.append({
-            "date": event.get("date", "")[:10],
-            "home_team": normalise_name(home["team"]["displayName"]),
-            "away_team": normalise_name(away["team"]["displayName"]),
-            "home_score": float(home_score) if home_score not in (None, "") else None,
-            "away_score": float(away_score) if away_score not in (None, "") else None,
-            "status": status,
-            "clock": comp.get("status", {}).get("displayClock", ""),
-            "period": comp.get("status", {}).get("period", 0),
+            "date":       event.get("date", "")[:10],
+            "home_team":  _espn_name(home["team"]["displayName"]),
+            "away_team":  _espn_name(away["team"]["displayName"]),
+            "home_score": float(hs)  if hs  not in (None, "") else None,
+            "away_score": float(as_) if as_ not in (None, "") else None,
+            "status":     status,
+            "clock":      comp.get("status", {}).get("displayClock", ""),
             "tournament": "FIFA World Cup",
-            "country": "United States",
-            "neutral": True,
+            "country":    "United States",
+            "neutral":    True,
+            "source":     "espn",
         })
-
     return matches
 
+
+# ── Unified fetch ──────────────────────────────────────────────────────────────
+
+def fetch_matches() -> list[dict]:
+    """Try football-data.org first; fall back to ESPN if it fails."""
+    matches = fetch_fd_matches()
+    if matches is not None:
+        print(f"[football-data.org] {len(matches)} matches fetched.")
+        return matches
+    print("[football-data.org] failed — falling back to ESPN...")
+    matches = fetch_espn_matches()
+    print(f"[ESPN] {len(matches)} matches fetched.")
+    return matches
+
+
+# ── Status helpers ─────────────────────────────────────────────────────────────
+
+def _is_finished(m: dict) -> bool:
+    return m["status"] in FD_FINISHED or m["status"] in ESPN_COMPLETED
+
+def _is_live(m: dict) -> bool:
+    return m["status"] in FD_LIVE or m["status"] == "STATUS_IN_PROGRESS"
+
+def _is_scheduled(m: dict) -> bool:
+    return m["status"] in FD_SCHEDULED or m["status"] == "STATUS_SCHEDULED"
+
+
+# ── Scoreboard display ─────────────────────────────────────────────────────────
 
 def print_scoreboard(matches: list[dict]):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
@@ -120,42 +209,43 @@ def print_scoreboard(matches: list[dict]):
     print(f"  WC 2026 Scoreboard  [{now}]")
     print(f"{'='*54}")
 
-    for label, status_filter in [
-        ("LIVE", lambda s: s == "STATUS_IN_PROGRESS"),
-        ("FINISHED", lambda s: s in COMPLETED_STATUSES),
-        ("UPCOMING", lambda s: s == "STATUS_SCHEDULED"),
-    ]:
-        group = [m for m in matches if status_filter(m["status"])]
+    for label, fn in [("LIVE", _is_live), ("FINISHED", _is_finished), ("UPCOMING", _is_scheduled)]:
+        group = [m for m in matches if fn(m)]
         if not group:
             continue
         print(f"\n  {label}:")
         for m in group:
-            if m["status"] == "STATUS_SCHEDULED":
+            if _is_scheduled(m):
                 print(f"    {m['date']}  {m['home_team']} vs {m['away_team']}")
             else:
-                hs = int(m["home_score"]) if m["home_score"] is not None else "?"
+                hs  = int(m["home_score"]) if m["home_score"] is not None else "?"
                 as_ = int(m["away_score"]) if m["away_score"] is not None else "?"
-                clock = f"  {m['clock']}" if m["clock"] and m["status"] == "STATUS_IN_PROGRESS" else ""
+                clock = f"  {m['clock']}" if m["clock"] and _is_live(m) else ""
                 print(f"    {m['home_team']} {hs} - {as_} {m['away_team']}{clock}")
     print()
 
 
+# ── Patch results into CSV ─────────────────────────────────────────────────────
+
 def patch_results(df: pd.DataFrame, live_matches: list[dict]) -> tuple[pd.DataFrame, list[str]]:
-    """Insert or update completed match scores. Returns (updated_df, change_list)."""
     df = df.copy()
     changes = []
 
     for m in live_matches:
-        if m["status"] not in COMPLETED_STATUSES:
+        if not _is_finished(m):
             continue
         if m["home_score"] is None or m["away_score"] is None:
             continue
 
         match_date = pd.to_datetime(m["date"])
+        # Match within ±1 day: live sources report UTC kickoff, which can roll to
+        # the next calendar day vs the scheduled date — an exact match would
+        # otherwise insert a duplicate row instead of updating the fixture.
+        day_gap = (df["date"] - match_date).abs().dt.days
         mask = (
             (df["home_team"] == m["home_team"])
             & (df["away_team"] == m["away_team"])
-            & (df["date"].dt.date == match_date.date())
+            & (day_gap <= 1)
             & (df["tournament"] == "FIFA World Cup")
         )
 
@@ -168,15 +258,15 @@ def patch_results(df: pd.DataFrame, live_matches: list[dict]) -> tuple[pd.DataFr
                 changes.append(f"UPDATED  {label}")
         else:
             new_row = pd.DataFrame([{
-                "date": match_date,
-                "home_team": m["home_team"],
-                "away_team": m["away_team"],
+                "date":       match_date,
+                "home_team":  m["home_team"],
+                "away_team":  m["away_team"],
                 "home_score": m["home_score"],
                 "away_score": m["away_score"],
                 "tournament": m["tournament"],
-                "city": "",
-                "country": m["country"],
-                "neutral": m["neutral"],
+                "city":       "",
+                "country":    m["country"],
+                "neutral":    m["neutral"],
             }])
             df = pd.concat([df, new_row], ignore_index=True)
             changes.append(f"INSERTED {label}")
@@ -185,9 +275,10 @@ def patch_results(df: pd.DataFrame, live_matches: list[dict]) -> tuple[pd.DataFr
     return df, changes
 
 
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
 def run_once(retrain: bool = False) -> bool:
-    print("Fetching from ESPN...")
-    matches = fetch_espn_matches()
+    matches = fetch_matches()
     if not matches:
         print("No data returned.")
         return False
@@ -208,7 +299,7 @@ def run_once(retrain: bool = False) -> bool:
             subprocess.run([sys.executable, "src/train.py", "--quick"])
         return True
     else:
-        finished = [m for m in matches if m["status"] in COMPLETED_STATUSES]
+        finished = [m for m in matches if _is_finished(m)]
         if finished:
             print(f"  {len(finished)} completed match(es) already recorded — no update needed.")
         else:
