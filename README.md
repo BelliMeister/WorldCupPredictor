@@ -170,7 +170,7 @@ After the match analysis, `predict.py` prints a **menu of player-prop markets** 
     To be booked     Barco 63%★   Capaldo 63%★   Martínez 37%
 ```
 
-Markets evaluated: **to score**, **to assist**, **goal or assist**, **1+ / 2+ shots on target**, **1+ / 2+ fouls committed**, **to be booked**. The premium goal markets rarely clear 60% (even elite strikers sit ~30–50% anytime-scorer), so they're shown anyway with their % — the ★ just marks the near-locks. Tune the star line via `PROP_THRESHOLD` in `src/player_props.py`.
+Markets evaluated: **to score**, **to assist**, **goal or assist**, **1+ / 2+ shots taken**, **1+ / 2+ shots on target**, **1+ / 2+ fouls committed**, **to be booked** — top 5 players each. The premium goal markets rarely clear 60% (even elite strikers sit ~30–50% anytime-scorer), so they're shown anyway with their % — the ★ just marks the near-locks. Tune the star line via `PROP_THRESHOLD` in `src/player_props.py`.
 
 **Likely starters first (▶ / ▷):** likely starters are listed first in every market, regardless of probability, and get full-match weighting (their shot/goal/foul rates aren't discounted for rotation) — a confirmed starter is a far safer prop than a higher-rated bench player who might not play. Two confidence levels:
 
@@ -187,6 +187,13 @@ Both are read from API-Football lineups by `fetch_player_stats.py`; re-run it af
 weight = 0.85 ^ (games_ago)  ×  importance(competition)
 ```
 where importance is World Cup 1.6, continental cups ~1.2, qualifiers ~1.1, friendlies 0.6. Captured per player: goals, shots, shots-on-target, assists, fouls, fouled, yellow/red cards.
+
+**Opponent defence adjustment (volume × quality):** shot / SoT / foul props are scaled by the opponent's *conceded* stats in `team_stats.csv`, split into two effects so a **compact "ten men behind the ball" defence is handled correctly**:
+
+- **Shot volume** (`shots_against`) — a packed defence still allows lots of shots, so *shots-taken* props get boosted.
+- **Shot quality** (SoT% the opponent allows vs league) — but those shots come from bad spots, so *shots-on-target* props are dampened. SoT is derived as `expected shots × player accuracy × opponent shot-quality`.
+
+Example: Australia concede ~20 shots/game (volume ×1.40) but at only 30% on-target vs 34% league (quality ×0.91), so a striker's shots-taken line jumps while his on-target line rises only modestly — instead of naively boosting both. The header prints both factors per team. Goal/assist props were already opponent-aware via the expected-goals split.
 
 **Note:** per-player xG is not available, so shot volume + conversion (shots/90, SoT/90, goals/shot) are used as the shooting-quality proxy. Debutant teams with no recent data show *"no props above 60%"*.
 

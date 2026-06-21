@@ -154,8 +154,11 @@ def _stat_value(stats: list[dict], type_name: str):
 
 def team_match_stats(team: dict, last: int) -> dict | None:
     """
-    Recency- and importance-weighted per-game team discipline / set-piece averages
-    from API-Football fixtures/statistics over the team's last `last` games.
+    Recency- and importance-weighted per-game team stats from API-Football over the
+    team's last `last` games — both what the team PRODUCES (corners, shots, fouls…)
+    and what it CONCEDES to opponents (shots_against, sot_against, corners_against,
+    fouls_against = fouls drawn). The 'against' columns are the team's defensive
+    profile, used to scale opponents' player props.
     """
     fixtures = get_last_fixtures(team["id"], last)
     if not fixtures:
@@ -164,16 +167,21 @@ def team_match_stats(team: dict, last: int) -> dict | None:
 
     FIELDS = {"corners": "Corner Kicks", "yellow": "Yellow Cards", "red": "Red Cards",
               "fouls": "Fouls", "shots": "Total Shots", "sot": "Shots on Goal"}
+    AGAINST = {"shots_against": "Total Shots", "sot_against": "Shots on Goal",
+               "corners_against": "Corner Kicks", "fouls_against": "Fouls"}
     acc = {k: 0.0 for k in FIELDS}
+    acc_against = {k: 0.0 for k in AGAINST}
     wsum = 0.0
     matches = 0
 
     for games_ago, fx in enumerate(fixtures):
         data = _api_get("fixtures/statistics", {"fixture": fx["fixture_id"]})
-        block = next((tm for tm in data.get("response", []) if tm["team"]["id"] == team["id"]), None)
-        if not block:
+        resp = data.get("response", [])
+        own = next((tm for tm in resp if tm["team"]["id"] == team["id"]), None)
+        opp = next((tm for tm in resp if tm["team"]["id"] != team["id"]), None)
+        if not own:
             continue
-        vals = {k: _stat_value(block["statistics"], name) for k, name in FIELDS.items()}
+        vals = {k: _stat_value(own["statistics"], name) for k, name in FIELDS.items()}
         if all(v is None for v in vals.values()):
             continue
         w = (RECENCY_DECAY ** games_ago) * importance_k(fx["league"])
@@ -181,11 +189,15 @@ def team_match_stats(team: dict, last: int) -> dict | None:
         matches += 1
         for k, v in vals.items():
             acc[k] += w * (v or 0.0)
+        if opp:
+            for k, name in AGAINST.items():
+                acc_against[k] += w * (_stat_value(opp["statistics"], name) or 0.0)
 
     if matches == 0 or wsum == 0:
         return None
     row = {"team": team["name"], "matches": matches}
     row.update({k: round(acc[k] / wsum, 2) for k in FIELDS})
+    row.update({k: round(acc_against[k] / wsum, 2) for k in AGAINST})
     return row
 
 

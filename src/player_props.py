@@ -21,7 +21,13 @@ import numpy as np
 import pandas as pd
 
 PLAYER_STATS_CSV = Path("data/raw/player_stats.csv")
+TEAM_STATS_CSV   = Path("data/raw/team_stats.csv")
 MATCH_XG_CSV     = Path("data/raw/wc2026_xg.csv")
+
+# Opponent-defence adjustment is clamped so a small/noisy sample can't swing a
+# prop too far (a leaky/stingy opponent moves the rate at most ±40%).
+DEF_FACTOR_MIN = 0.65
+DEF_FACTOR_MAX = 1.40
 
 # Recency decay for the live WC xG signal (most recent match weighted highest)
 XG_DECAY = 0.85
@@ -83,6 +89,51 @@ def load_player_stats() -> pd.DataFrame | None:
     return df
 
 
+def load_team_stats() -> pd.DataFrame | None:
+    if not TEAM_STATS_CSV.exists():
+        return None
+    df = pd.read_csv(TEAM_STATS_CSV)
+    df["team"] = df["team"].replace(TEAM_NAME_MAP)
+    return df
+
+
+def defensive_factors(team_stats: pd.DataFrame | None, opponent: str) -> dict[str, float]:
+    """
+    How leaky/stingy `opponent` is vs league average, split into:
+      - shots   : shot VOLUME conceded (a compact side still allows many shots)
+      - quality : SoT% the opponent allows vs league — a packed box forces
+                  low-quality attempts, so this dampens on-target/goal props even
+                  when shot volume is high (the 'ten men behind the ball' effect)
+      - fouls   : fouls the opponent draws → fouls our players commit
+    Each is a multiplier around 1.0, clamped ±40%. Neutral (1.0) when unknown.
+    """
+    neutral = {"shots": 1.0, "quality": 1.0, "fouls": 1.0}
+    if team_stats is None or "shots_against" not in team_stats.columns:
+        return neutral
+    row = team_stats[team_stats["team"] == opponent]
+    if row.empty:
+        return neutral
+    r = row.iloc[0]
+
+    def factor(against_col: str) -> float:
+        league = team_stats[against_col].mean()
+        if not league or pd.isna(r.get(against_col)):
+            return 1.0
+        return float(np.clip(r[against_col] / league, DEF_FACTOR_MIN, DEF_FACTOR_MAX))
+
+    # Shot quality conceded: opponent's SoT% allowed vs the league's SoT%.
+    shots_a = r.get("shots_against")
+    sot_a   = r.get("sot_against")
+    lg_q = team_stats["sot_against"].mean() / team_stats["shots_against"].mean()
+    if shots_a and not pd.isna(sot_a) and lg_q:
+        quality = float(np.clip((sot_a / shots_a) / lg_q, DEF_FACTOR_MIN, DEF_FACTOR_MAX))
+    else:
+        quality = 1.0
+
+    return {"shots": factor("shots_against"), "quality": quality,
+            "fouls": factor("fouls_against")}
+
+
 def _start_fraction(row) -> float:
     """Estimate the share of a full match a player typically plays (caps sub noise)."""
     matches = row.get("matches", 0) or 0
@@ -92,11 +143,14 @@ def _start_fraction(row) -> float:
     return 0.6  # unknown — assume rotation player
 
 
-def team_props(stats: pd.DataFrame, team: str, team_mu: float, n_top: int = 6) -> list[dict]:
+def team_props(stats: pd.DataFrame, team: str, team_mu: float, n_top: int = 6,
+               opp_factors: dict[str, float] | None = None) -> list[dict]:
     """
     Compute per-player props for one team given its expected goals (team_mu).
-    Returns the n_top most likely goal threats, sorted by scoring probability.
+    `opp_factors` scales the shot/SoT/foul props by the opponent's defensive
+    leakiness (see defensive_factors). Returns the n_top players by score prob.
     """
+    f = opp_factors or {"shots": 1.0, "quality": 1.0, "fouls": 1.0}
     squad = stats[stats["team"] == team].copy()
     if squad.empty:
         return []
@@ -140,9 +194,14 @@ def team_props(stats: pd.DataFrame, team: str, team_mu: float, n_top: int = 6) -
         goal_lambda   = team_mu * (r["goal_weight"] / g_total) if g_total > 0 else 0.0
         assist_lambda = team_assist_mu * (r["assist_weight"] / a_total) if a_total > 0 else 0.0
 
-        exp_shots = r["shots_per90"]  * r["start_frac"]
-        exp_sot   = r["sot_per90"]    * r["start_frac"]
-        exp_fouls = r["fouls_per90"]  * r["start_frac"]
+        # Shots: scaled by opponent shot VOLUME conceded.
+        exp_shots = r["shots_per90"] * r["start_frac"] * f["shots"]
+        # SoT: derive from expected shots × the player's own on-target accuracy ×
+        # the opponent's shot-quality factor (compact defences force worse shots),
+        # so a leaky-but-compact side boosts shots far more than shots-on-target.
+        accuracy = r["sot_per90"] / r["shots_per90"] if r["shots_per90"] > 0 else 0.34
+        exp_sot   = exp_shots * min(max(accuracy, 0.05), 0.6) * f["quality"]
+        exp_fouls = r["fouls_per90"] * r["start_frac"] * f["fouls"]
         card_lam  = r["yellow_per90"] * r["start_frac"]
 
         props.append({
@@ -155,6 +214,8 @@ def team_props(stats: pd.DataFrame, team: str, team_mu: float, n_top: int = 6) -
             "p_assist":      _poisson_ge1(assist_lambda),
             "p_goal_or_ast": _poisson_ge1(goal_lambda + assist_lambda),
             "exp_shots":     exp_shots,
+            "p_shots_1plus": _poisson_ge1(exp_shots),
+            "p_shots_2plus": _poisson_ge2(exp_shots),
             "exp_sot":       exp_sot,
             "p_sot_1plus":   _poisson_ge1(exp_sot),
             "p_sot_2plus":   _poisson_ge2(exp_sot),
@@ -176,6 +237,8 @@ PROP_LABELS = {
     "p_score":       "to score",
     "p_assist":      "to assist",
     "p_goal_or_ast": "goal or assist",
+    "p_shots_1plus": "1+ shots taken",
+    "p_shots_2plus": "2+ shots taken",
     "p_sot_1plus":   "1+ shot on target",
     "p_sot_2plus":   "2+ shots on target",
     "p_foul_1plus":  "1+ fouls committed",
@@ -189,6 +252,8 @@ PROP_MARKETS = [
     ("To score",        "p_score"),
     ("To assist",       "p_assist"),
     ("Goal or assist",  "p_goal_or_ast"),
+    ("Shots taken 1+",  "p_shots_1plus"),
+    ("Shots taken 2+",  "p_shots_2plus"),
     ("Shot on target",  "p_sot_1plus"),
     ("2+ shots on tgt", "p_sot_2plus"),
     ("Fouls 1+",        "p_foul_1plus"),
@@ -198,13 +263,15 @@ PROP_MARKETS = [
 
 
 def props_by_market(stats: pd.DataFrame, team: str, team_mu: float,
-                    top_n: int = 3) -> list[tuple[str, list[dict]]]:
+                    top_n: int = 3,
+                    opp_factors: dict[str, float] | None = None) -> list[tuple[str, list[dict]]]:
     """
     Group props by betting market. Returns [(market_label, [top players]), ...]
     where each player is {player, position, prob}. Shows the best candidates in
     every market (so scorer/assist always appear, even below the 60% line).
+    `opp_factors` adjusts shot/SoT/foul props for the opponent's defence.
     """
-    everyone = team_props(stats, team, team_mu, n_top=99)
+    everyone = team_props(stats, team, team_mu, n_top=99, opp_factors=opp_factors)
     out = []
     for label, key in PROP_MARKETS:
         # Likely starters rank first, then by probability — a known/likely

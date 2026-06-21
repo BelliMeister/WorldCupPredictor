@@ -20,8 +20,9 @@ from features import (
     _decay_mean,
 )
 from player_props import (
-    load_player_stats, load_match_xg, props_by_market, split_expected_goals,
-    team_attack_strength, PROP_THRESHOLD, TEAM_NAME_MAP,
+    load_player_stats, load_match_xg, load_team_stats, defensive_factors,
+    props_by_market, split_expected_goals, team_attack_strength,
+    PROP_THRESHOLD, TEAM_NAME_MAP,
 )
 from goal_timing import load_goal_timing, half_scoring_probs
 
@@ -408,10 +409,17 @@ def print_player_props(home: str, away: str, home_mu: float, away_mu: float):
         print("\n  PLAYER PROPS — run `python src/fetch_player_stats.py` to enable")
         return
 
+    # Each team's shot/foul props are scaled by the OPPONENT's defensive profile.
+    team_stats = load_team_stats()
+    home_opp_factors = defensive_factors(team_stats, away)
+    away_opp_factors = defensive_factors(team_stats, home)
+
     print(f"\n  PLAYER PROPS  (per market — ▶ WC MW1 starter, ▷ started last 3; listed first; ★ = above {PROP_THRESHOLD:.0%})")
     print(f"  expected goals: {home} {home_mu:.2f} / {away} {away_mu:.2f}")
-    for team, mu in [(home, home_mu), (away, away_mu)]:
-        markets = props_by_market(stats, team, mu, top_n=3)
+    print(f"  opp-defence adj  {home}: shots ×{home_opp_factors['shots']:.2f}, shot-quality ×{home_opp_factors['quality']:.2f}"
+          f"  |  {away}: shots ×{away_opp_factors['shots']:.2f}, shot-quality ×{away_opp_factors['quality']:.2f}")
+    for team, mu, opp_f in [(home, home_mu, home_opp_factors), (away, away_mu, away_opp_factors)]:
+        markets = props_by_market(stats, team, mu, top_n=5, opp_factors=opp_f)
         print(f"\n  {team.upper()}")
         if not any(rows for _, rows in markets):
             print("    no player data")
